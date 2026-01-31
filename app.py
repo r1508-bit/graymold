@@ -952,8 +952,8 @@ def plot_risk_heatmap(risk_df):
     return fig
 
 def main():
-    st.set_page_config(page_title="🍓 イチゴ灰色かび病リスク判定ツール", layout="wide")
-    st.title("🍓 イチゴ灰色かび病リスク判定ツール")
+    st.set_page_config(page_title="🍓 イチゴ灰色かび病リスク判断ツール", layout="wide")
+    st.title("🍓 イチゴ灰色かび病リスク判断ツール")
     st.header("👇CSVファイルをアップロードしてください\n※アップロードされたファイルは終了時自動的に削除されます。")
 
     # ファイルアップローダー（センサータイプは自動検出のみ）
@@ -1038,7 +1038,7 @@ def main():
     st.markdown("---")
     st.markdown(
         "<p style='text-align: center; color: gray; font-size: 11px;'>"
-        "本ツールの判定結果は参考情報であり、実際の防除判断は現場の状況を確認の上、ご自身の責任で行ってください。"
+        "本ツールの判断結果は参考情報であり、実際の防除判断は現場の状況を確認の上、ご自身の責任で行ってください。"
         "</p>"
         "<p style='text-align: center; color: gray; font-size: 12px;'>"
         "&copy; 大分県農林水産研究指導センター農業研究部"
