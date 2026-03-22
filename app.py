@@ -4,11 +4,15 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import japanize_matplotlib
 from datetime import datetime
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import os
 import re
 from matplotlib.patches import Patch
+
+_CSV_CACHE_MAX = 256
+_csv_encoding_cache: Dict[Tuple[str, int, int], str] = {}
+_tabular_columns_cache: Dict[Tuple[str, int, int], List[str]] = {}
 
 # 灰色かび病リスクチェック関数
 def check_gray_mold_risk(temp_humidity_data: List[Tuple[float, float]], timestamps) -> Tuple[str, int, str]:
@@ -66,11 +70,14 @@ def read_temperature_and_humidity_data(file_obj, device_type=None, days_to_keep=
     
     # メイン処理開始
     temp_path = None
+    is_uploaded_file = hasattr(file_obj, 'read')
     try:
         # アップロードされたファイルを一時ファイルに保存
         import tempfile
-        if hasattr(file_obj, 'read'):  # UploadedFileオブジェクトの場合
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as tmp_file:
+        if is_uploaded_file:  # UploadedFileオブジェクトの場合
+            uploaded_name = getattr(file_obj, 'name', '')
+            uploaded_suffix = os.path.splitext(uploaded_name)[1].lower() or '.csv'
+            with tempfile.NamedTemporaryFile(delete=False, suffix=uploaded_suffix) as tmp_file:
                 tmp_file.write(file_obj.getbuffer())
                 temp_path = tmp_file.name
         else:  # 文字列（ファイルパス）の場合
@@ -132,40 +139,37 @@ def read_temperature_and_humidity_data(file_obj, device_type=None, days_to_keep=
         
         # デバイスタイプの自動検出を試みる（デバイスタイプが未指定の場合）
         if device_type is None:
+            # まずヘッダだけを読み込んで列構造を確認
+            cols = read_tabular_columns_robust(temp_path)
 
-            # ファイルを読み込んでヘッダーを確認
-            df, encoding = try_multiple_encodings(temp_path)
-            if df is not None:
-                cols = df.columns.tolist()
-
-                # 特殊パターンの検出（優先順位順）
-                # PF2形式の検出（PF 測定 気温 と 日付+時刻が別カラム）
-                if any('PF 測定' in col for col in cols) or ('日付' in cols and '時刻' in cols and '湿度' in cols):
-                    device_type = 'PF2'
-                # KN形式の検出（温度センサ１等の全角数字を含む）
-                elif any('温度センサ１' in col or '温度センサ２' in col for col in cols):
-                    device_type = 'KN'
-                # SB形式の検出（SwitchBot系、タイポ含む）
-                elif any('Timestamp' in col or 'Timamp' in col or 'Temperature' in col or 'Temperatre' in col for col in cols):
-                    device_type = 'SB'
-                else:
-                    # 各デバイスタイプの特徴と照合
-                    for dev, config in device_configs.items():
-                        # 温度列が存在するか確認
-                        for col_name in config['temp_cols']:
-                            if col_name in cols:
-                                device_type = dev
-                                break
-                        if device_type:
-                            break
-
-                # ファジーマッチングでの検出（最終手段）
-                if device_type is None:
-                    for dev, config in device_configs.items():
-                        matched = find_column_fuzzy(cols, config['temp_cols'])
-                        if matched:
+            # 特殊パターンの検出（優先順位順）
+            # PF2形式の検出（PF 測定 気温 と 日付+時刻が別カラム）
+            if any('PF 測定' in col for col in cols) or ('日付' in cols and '時刻' in cols and '湿度' in cols):
+                device_type = 'PF2'
+            # KN形式の検出（温度センサ１等の全角数字を含む）
+            elif any('温度センサ１' in col or '温度センサ２' in col for col in cols):
+                device_type = 'KN'
+            # SB形式の検出（SwitchBot系、タイポ含む）
+            elif any('Timestamp' in col or 'Timamp' in col or 'Temperature' in col or 'Temperatre' in col for col in cols):
+                device_type = 'SB'
+            else:
+                # 各デバイスタイプの特徴と照合
+                for dev, config in device_configs.items():
+                    # 温度列が存在するか確認
+                    for col_name in config['temp_cols']:
+                        if col_name in cols:
                             device_type = dev
                             break
+                    if device_type:
+                        break
+
+            # ファジーマッチングでの検出（最終手段）
+            if device_type is None:
+                for dev, config in device_configs.items():
+                    matched = find_column_fuzzy(cols, config['temp_cols'])
+                    if matched:
+                        device_type = dev
+                        break
 
             # 自動検出できない場合はデフォルトとしてSBを使用
             if device_type is None:
@@ -175,10 +179,7 @@ def read_temperature_and_humidity_data(file_obj, device_type=None, days_to_keep=
         config = device_configs.get(device_type, device_configs['SB'])
 
         # ファイル読み込み
-        df, _ = try_multiple_encodings(temp_path)
-        if df is None:
-            st.error("ファイル読み込みに失敗しました")
-            return None, None, None
+        df, _ = read_tabular_data_robust(temp_path)
         
         # タイムスタンプ列の特定と処理（デバイスタイプに応じた処理）
         timestamp_found = False
@@ -199,54 +200,12 @@ def read_temperature_and_humidity_data(file_obj, device_type=None, days_to_keep=
             
             df = df.set_index('datetime')
             timestamp_found = True
-            
-        if device_type == 'SB':
-            try:
-                # SwitchBotファイルはUTF-8で強制的に読み直し
-                df = pd.read_csv(temp_path, encoding='utf-8')
-            except Exception as e:
-                st.warning(f"UTF-8での読み込みに失敗しました: {str(e)}")
         
         # 一般的なタイムスタンプ列の処理
         if not timestamp_found:
             for ts_col in config['timestamp_cols']:
                 if ts_col in df.columns:
-                    # タイムスタンプをdatetime型に変換（複数のフォーマットを試行）
-                    original_count = len(df)
-
-                    # 文字列に変換（数値や他の型の場合に対応）
-                    ts_series = df[ts_col].astype(str).str.strip()
-
-                    # まず自動解析を試みる
-                    df['datetime'] = pd.to_datetime(ts_series, errors='coerce')
-
-                    # 失敗した場合、明示的なフォーマットを試す
-                    nat_count = df['datetime'].isna().sum()
-                    if nat_count == original_count:
-                        # 全行失敗 -> フォーマットを明示的に指定して再試行
-                        # 様々なフォーマットをカバー（ゼロ埋めなしも含む）
-                        datetime_formats = [
-                            '%Y/%m/%d %H:%M:%S',  # 2024/09/26 15:35:00
-                            '%Y-%m-%d %H:%M:%S',  # 2024-09-26 15:35:00
-                            '%Y/%m/%d %H:%M',     # 2024/09/26 15:35
-                            '%Y-%m-%d %H:%M',     # 2024-09-26 15:35
-                        ]
-                        for fmt in datetime_formats:
-                            try:
-                                df['datetime'] = pd.to_datetime(ts_series, format=fmt, errors='coerce')
-                                nat_count = df['datetime'].isna().sum()
-                                if nat_count < original_count:
-                                    break
-                            except Exception:
-                                continue
-
-                        # まだ全行失敗の場合、柔軟な解析を試す
-                        if nat_count == original_count:
-                            try:
-                                # infer_datetime_format=Trueは廃止されたため、format='mixed'を使用
-                                df['datetime'] = pd.to_datetime(ts_series, format='mixed', dayfirst=False, errors='coerce')
-                            except Exception:
-                                pass
+                    df['datetime'] = coerce_mixed_datetime_series(df[ts_col])
 
                     # NaT値をチェック
                     nat_count = df['datetime'].isna().sum()
@@ -274,6 +233,7 @@ def read_temperature_and_humidity_data(file_obj, device_type=None, days_to_keep=
             return None, None, None
         
         if timestamp_found:
+            df = df.sort_index()
             if len(df) > 0:  # 空のDataFrameでないことを確認
                 # 最新の日付を特定
                 latest_date = df.index.max()
@@ -390,54 +350,95 @@ def read_temperature_and_humidity_data(file_obj, device_type=None, days_to_keep=
     
     finally:
         # 一時ファイルを確実に削除
-        if temp_path and hasattr(file_obj, 'read'):
+        if temp_path and is_uploaded_file:
             try:
-                import os
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
             except Exception as e:
                 st.warning(f"一時ファイル削除エラー: {str(e)}")
 
-def try_multiple_encodings(file_path):
-    """複数のエンコーディングを試してCSVファイルを読み込む関数（BOM検出対応）"""
-
-    def read_with_encoding(file_path, encoding):
-        """指定されたエンコーディングでCSVを読み込み、末尾の空カラムを削除"""
-        # まずヘッダーの列数を取得
-        with open(file_path, 'r', encoding=encoding) as f:
-            header = f.readline()
-        header_cols = len(header.strip().split(','))
-
-        # ヘッダー列数に合わせてデータを読み込む（余分な列は無視）
-        df = pd.read_csv(file_path, encoding=encoding, usecols=range(header_cols))
-        return df
-
-    # BOM検出
+def get_file_signature(file_path) -> Optional[Tuple[str, int, int]]:
+    """キャッシュキー用のファイル署名を返す"""
     try:
-        with open(file_path, 'rb') as f:
-            raw = f.read(4)
+        stat = os.stat(file_path)
+        return (os.path.abspath(file_path), int(stat.st_mtime_ns), int(stat.st_size))
+    except OSError:
+        return None
 
-        # UTF-8 BOMの検出
-        if raw.startswith(b'\xef\xbb\xbf'):
-            try:
-                df = read_with_encoding(file_path, 'utf-8-sig')
-                return df, 'utf-8-sig'
-            except Exception:
-                pass
-    except Exception:
-        pass
+def _set_cache_value(cache, key, value) -> None:
+    """簡易キャッシュへ値を保存する"""
+    cache[key] = value
+    if len(cache) > _CSV_CACHE_MAX:
+        oldest_key = next(iter(cache))
+        cache.pop(oldest_key, None)
 
-    # エンコーディング優先順位（BOMなしの場合）
-    encodings = ['utf-8', 'shift-jis', 'cp932', 'utf-8-sig']
+def _normalize_columns(columns) -> List[str]:
+    """列名の前後空白や BOM を除去する"""
+    return [str(col).replace('\ufeff', '').strip() for col in columns]
 
-    for encoding in encodings:
+def _get_candidate_encodings(file_path) -> List[str]:
+    """読み込み候補の文字コード一覧を返す"""
+    default_encodings = ['utf-8-sig', 'utf-8', 'shift-jis', 'cp932']
+    signature = get_file_signature(file_path)
+    if signature is not None and signature in _csv_encoding_cache:
+        cached_encoding = _csv_encoding_cache[signature]
+        return [cached_encoding] + [enc for enc in default_encodings if enc != cached_encoding]
+    return default_encodings
+
+def _remember_encoding(file_path, encoding) -> None:
+    """成功した文字コードをキャッシュへ保存する"""
+    signature = get_file_signature(file_path)
+    if signature is not None:
+        _set_cache_value(_csv_encoding_cache, signature, encoding)
+
+def _read_excel_robust(file_path, **kwargs) -> pd.DataFrame:
+    """Excel ファイルを読み込む"""
+    try:
+        return pd.read_excel(file_path, **kwargs)
+    except ImportError as exc:
+        raise ValueError("Excel ファイルの読み込みには openpyxl または xlrd が必要です") from exc
+
+def read_tabular_data_robust(file_path, **kwargs):
+    """CSV / Excel を判別して堅牢に読み込む"""
+    extension = os.path.splitext(str(file_path))[1].lower()
+    if extension in ['.xlsx', '.xls']:
+        df = _read_excel_robust(file_path, **kwargs)
+        df.columns = _normalize_columns(df.columns)
+        return df, 'excel'
+
+    last_error = None
+    csv_kwargs = dict(kwargs)
+    csv_kwargs.setdefault('index_col', False)
+    for encoding in _get_candidate_encodings(file_path):
         try:
-            df = read_with_encoding(file_path, encoding)
+            df = pd.read_csv(file_path, encoding=encoding, engine='python', **csv_kwargs)
+            df.columns = _normalize_columns(df.columns)
+            _remember_encoding(file_path, encoding)
             return df, encoding
-        except Exception:
+        except (UnicodeDecodeError, UnicodeError, LookupError) as exc:
+            last_error = exc
+            continue
+        except Exception as exc:
+            last_error = exc
             continue
 
-    return None, None
+    raise ValueError("ファイルを読み込めませんでした: {} (最後のエラー: {})".format(file_path, last_error))
+
+def read_tabular_columns_robust(file_path) -> List[str]:
+    """CSV / Excel の列名だけを堅牢に読み込む"""
+    signature = get_file_signature(file_path)
+    if signature is not None and signature in _tabular_columns_cache:
+        return list(_tabular_columns_cache[signature])
+
+    columns = read_tabular_data_robust(file_path, nrows=0)[0].columns.tolist()
+    current_signature = get_file_signature(file_path)
+    if current_signature is not None:
+        _set_cache_value(_tabular_columns_cache, current_signature, list(columns))
+    return columns
+
+def try_multiple_encodings(file_path):
+    """互換用ラッパー。CSV / Excel を判別して読み込む"""
+    return read_tabular_data_robust(file_path)
 
 def find_column_fuzzy(columns, patterns, threshold=0.6):
     """
@@ -497,40 +498,119 @@ def find_column_fuzzy(columns, patterns, threshold=0.6):
 def combine_date_time(df, date_col='日付', time_col='時刻'):
     """日付列と時刻列を結合してdatetime型の列を作成する関数"""
     try:
-        # 時刻列のクリーニング（*を削除）
-        if time_col in df.columns:
-            df[time_col] = df[time_col].astype(str).str.replace('*', '', regex=False)
-            df[time_col] = df[time_col].str.strip()
-
-        # 行ごとに日時を変換
-        dates = []
-        for _, row in df.iterrows():
-            try:
-                date_str = str(row[date_col]).strip()
-                time_str = str(row[time_col]).strip()
-
-                # 時刻が数字だけの場合は ":00" を追加
-                if time_str.isdigit() and len(time_str) <= 2:
-                    time_str = f"{time_str}:00"
-
-                # 日付と時刻を結合
-                date_time_str = f"{date_str} {time_str}"
-
-                # datetimeに変換
-                date_time = pd.to_datetime(date_time_str, errors='coerce')
-                dates.append(date_time)
-
-            except Exception:
-                dates.append(pd.NaT)  # 変換できない場合はNaN値を追加
-
-        # 新しい日時列を作成
-        return pd.Series(dates)
+        date_series = df[date_col].astype(str).str.strip()
+        time_series = df[time_col].astype(str).str.replace('*', '', regex=False).str.strip()
+        hour_only_mask = time_series.str.fullmatch(r'\d{1,2}')
+        time_series.loc[hour_only_mask] = time_series.loc[hour_only_mask] + ':00'
+        return coerce_mixed_datetime_series(date_series + ' ' + time_series)
         
     except Exception as e:
         st.error(f"日付と時刻の結合に失敗: {str(e)}")
         import traceback
         st.text(traceback.format_exc())
         return pd.Series([pd.NaT] * len(df))
+
+def _normalize_datetime_candidate_text(text: str) -> str:
+    """日時候補文字列の軽微な表記ゆれを正規化する"""
+    normalized = text.strip().strip('"').strip("'").replace('\u3000', ' ')
+    normalized = normalized.replace('*', '')
+    normalized = re.sub(r'\s+', ' ', normalized)
+    normalized = normalized.replace('T', ' ')
+    normalized = re.sub(r'^(\d{4})\.(\d{1,2})\.(\d{1,2})(.*)$', r'\1/\2/\3\4', normalized)
+    normalized = re.sub(r'(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日', r'\1/\2/\3', normalized)
+    normalized = re.sub(r'(\d{1,2})時\s*(\d{1,2})分\s*(\d{1,2})秒', r'\1:\2:\3', normalized)
+    normalized = re.sub(r'(\d{1,2})時\s*(\d{1,2})分', r'\1:\2', normalized)
+    normalized = re.sub(r'(\d{1,2})時', r'\1:00', normalized)
+    return normalized.strip()
+
+def _parse_excel_serial_datetime(value) -> pd.Timestamp:
+    """Excel シリアル日時を Timestamp に変換する"""
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return pd.NaT
+
+    if not (20000 <= numeric_value <= 100000):
+        return pd.NaT
+    return pd.Timestamp('1899-12-30') + pd.to_timedelta(numeric_value, unit='D')
+
+def _parse_datetime_with_day_rollover(text: str) -> pd.Timestamp:
+    """24:00 表記を翌日 00:00 として扱う"""
+    match = re.match(r'^(.*?)(?:\s+|T)24:(\d{2})(?::(\d{2}))?(.*)$', text)
+    if not match:
+        return pd.NaT
+
+    date_part = match.group(1).strip()
+    minute_part = match.group(2)
+    second_part = match.group(3) or '00'
+    suffix_part = match.group(4).strip()
+    if minute_part != '00' or second_part != '00':
+        return pd.NaT
+
+    base_date = pd.to_datetime(date_part, errors='coerce')
+    if pd.isna(base_date):
+        return pd.NaT
+
+    rolled = base_date + pd.Timedelta(days=1)
+    rollover_text = '{} 00:00:00'.format(rolled.strftime('%Y-%m-%d'))
+    if suffix_part:
+        rollover_text = '{} {}'.format(rollover_text, suffix_part)
+    return pd.to_datetime(rollover_text, errors='coerce')
+
+def _parse_datetime_fallback_value(value) -> pd.Timestamp:
+    """単一値の補助日時パーサー"""
+    if pd.isna(value):
+        return pd.NaT
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _parse_excel_serial_datetime(value)
+
+    text = _normalize_datetime_candidate_text(str(value))
+    if not text:
+        return pd.NaT
+
+    if re.fullmatch(r'\d+(?:\.\d+)?', text):
+        excel_dt = _parse_excel_serial_datetime(text)
+        if not pd.isna(excel_dt):
+            return excel_dt
+
+    rollover_dt = _parse_datetime_with_day_rollover(text)
+    if not pd.isna(rollover_dt):
+        return rollover_dt
+
+    return pd.to_datetime(text, errors='coerce')
+
+def coerce_mixed_datetime_series(values) -> pd.Series:
+    """混在フォーマットを含む日時列を datetime に寄せて変換する"""
+    series = pd.Series(values).copy()
+    if series.empty:
+        return pd.to_datetime(series, errors='coerce')
+
+    if getattr(series, 'dtype', None) == object:
+        series = series.map(
+            lambda value: _normalize_datetime_candidate_text(value) if isinstance(value, str) else value
+        )
+
+    parsed = pd.to_datetime(series, errors='coerce')
+    remaining_mask = parsed.isna() & series.notna()
+    if not remaining_mask.any():
+        return parsed
+
+    remaining_values = series.loc[remaining_mask]
+    try:
+        reparsed = pd.to_datetime(remaining_values, errors='coerce', format='mixed')
+    except TypeError:
+        reparsed = remaining_values.map(lambda value: pd.to_datetime(value, errors='coerce'))
+
+    reparsed_series = pd.Series(reparsed, index=remaining_values.index)
+    unresolved_mask = reparsed_series.isna() & remaining_values.notna()
+    if unresolved_mask.any():
+        reparsed_series.loc[unresolved_mask] = remaining_values.loc[unresolved_mask].map(
+            _parse_datetime_fallback_value
+        )
+
+    parsed.loc[remaining_mask] = reparsed_series
+    return parsed
 
 def convert_to_numeric(df, columns):
     """指定された列を数値型に変換する関数"""
